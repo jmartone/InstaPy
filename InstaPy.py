@@ -3,6 +3,7 @@ from time import sleep
 import hmac
 from hashlib import sha256
 import requests
+import sys
 
 def threaded(fn):
     def wrapper(*args, **kwargs):
@@ -13,6 +14,7 @@ def threaded(fn):
     return wrapper
 
 # 34 page not found
+# 44 invalid parameter
 # 50 user not found
 # 87 not permitted to access user
 # 500 internal server error
@@ -23,7 +25,6 @@ class InstagramError(Exception):
         Exception.__init__(self,*args,**kwargs)
 
 class InstaPy:
-    available = threading.Event()
     
     def __init__(self, tokens, client_secret, *args, **kwargs):
         self.tokens = tokens
@@ -34,6 +35,7 @@ class InstaPy:
         self.timers = [False for _ in self.tokens]
         self.cycle = 0
         self.calls = 0
+        self.available = threading.Event()
 
     # timer begins running as soon as the token is used, rate limits are refreshed after an hour
     @threaded
@@ -58,7 +60,7 @@ class InstaPy:
     def hitLimit(self):
         print("Attempting to cycle tokens")
         self.limited[self.cycle] = True
-        self.cycleTokens()
+        return self.cycleTokens()
 
     def cycleTokens(self):
         # if all the tokens are limited wait for one to open
@@ -67,6 +69,7 @@ class InstaPy:
             self.available.clear()
             while not self.available.wait(1):
                 pass
+        # find the open token
         for c, limit in enumerate(self.limited):
             if (not limit):
                 self.cycle = c
@@ -89,9 +92,13 @@ class InstaPy:
                                        final_sig)
     
     # makes each request `maxTries` times then returns the result
-    def _makeRequest(self, endpoint, params = {}, *args, **kwargs):
+    def _makeRequest(self, endpoint, params = None, *args, **kwargs):
         sus = kwargs.get('sus', 60)
         headers = kwargs.pop('headers', {})
+        token = kwargs.pop('token', False)
+        if not params:
+            params = {}
+        params.update(kwargs)
         url = self._generateUrl(endpoint, params, *args, **kwargs)
         t = 0
         while t < self.maxTries:
@@ -110,11 +117,13 @@ class InstaPy:
             elif (r.status_code == 429):
                 print('Hit rate limit')
                 # if the request includes a set `token` do not cycle tokens when limited
-                if (kwargs.get('token', False)):
+                if token:
                     break
                 else:
-                    self.hitLimit()
-                    continue
+                    if (self.hitLimit()):
+                        continue
+                    else:
+                        break
             elif (r.status_code == 400):
                 if (r.json()['meta']['error_type'] == 'OAuthPermissionsException'):
                     raise InstagramError('The current authentication token ({}) is not permitted to perform this action.'.format(), code = 403)
@@ -122,6 +131,8 @@ class InstaPy:
                     raise InstagramError('Instagram will not allow you to view this resource', code = 87)
                 elif (r.json()['meta']['error_type'] == 'APINotFoundError'):
                     raise InstagramError('Instagram cannot find this resource ', code = 34)
+                elif (r.json()['meta']['error_type'] == 'APIInvalidParametersError'):
+                    raise InstagramError('One or more of your parameters was invalid: {}'.format(r.json()['meta']['error_message']), code = 44)
                 else:
                     print r.json()
                     print('Instagram is getting suspicious, waiting {} seconds then trying again.'.format(sus))
@@ -142,7 +153,7 @@ class InstaPy:
             if (cursor):
                 params['cursor'] = cursor
 
-            r = self._makeRequest(endpoint, params, token = token)
+            r = self._makeRequest(endpoint, params, token = token, *args, **kwargs)
             if (r.status_code == 429):
                 if (cursor):
                     print('Current Cursor: {}'.format(cursor))
@@ -173,7 +184,7 @@ class InstaPy:
             'count': 50,
             'q': handle
         }
-        r = self._makeRequest(endpoint, params)
+        r = self._makeRequest(endpoint, params, *args, **kwargs)
         if (r.status_code != 200):
             raise InstagramError('Could not connect to {} endpoint (Code: {})'.format(endpoint, r.status_code), code = 500)
         results = r.json()
@@ -198,7 +209,11 @@ class InstaPy:
             if (cursor):
                 params['max_id'] = cursor
                 
-            r = self._makeRequest(endpoint, params)
+            try:
+                r = self._makeRequest(endpoint, params, *args, **kwargs)
+            except KeyboardInterrupt:
+                print("Exiting...")
+                break
             if (r.status_code != 200):
                 raise InstagramError('Could not connect to {} endpoint (Code: {})'.format(endpoint, r.status_code), code = 500)
             
@@ -216,7 +231,7 @@ class InstaPy:
         
     def media_comments(self, media_id, *args, **kwargs):
         endpoint = 'media/{}/comments'.format(media_id)
-        r = self._makeRequest(endpoint)
+        r = self._makeRequest(endpoint, *args, **kwargs)
         if (r.status_code != 200):
             raise InstagramError('Could not connect to {} endpoint (Code: {})'.format(endpoint, r.status_code), code = 500)
         
@@ -225,7 +240,7 @@ class InstaPy:
     
     def media_likes(self, media_id, *args, **kwargs):
         endpoint = 'media/{}/likes'.format(media_id)
-        r = self._makeRequest(endpoint)
+        r = self._makeRequest(endpoint, *args, **kwargs)
         if (r.status_code != 200):
             raise InstagramError('Could not connect to {} endpoint (Code: {})'.format(endpoint, r.status_code), code = 500)
         
@@ -236,14 +251,14 @@ class InstaPy:
         endpoint = 'media/shortcode/{}'.format(media_id)
         if (media_id.isdigit() and len(media_id) > 11):
             endpoint = 'media/{}'.format(media_id)
-        r = self._makeRequest(endpoint)
+        r = self._makeRequest(endpoint, *args, **kwargs)
         if (r.status_code != 200):
             raise InstagramError('Could not connect to {} endpoint (Code: {})'.format(endpoint, r.status_code), code = 500)
         
         results = r.json()
         return(results['data'])
 
-    def locations_search(self, lat, lng, distance = 500, *arg, **kwargs):
+    def locations_search(self, lat, lng, distance = 500, *args, **kwargs):
         endpoint = 'locations/search'
         params = {
             'lat': lat,
@@ -251,30 +266,85 @@ class InstaPy:
             'distance': distance,
             'facebook_places_id': kwargs.pop('facebook_places_id', None)
         }
-        r = self._makeRequest(endpoint, params)
+        r = self._makeRequest(endpoint, params, *args, **kwargs)
         if (r.status_code != 200):
             raise InstagramError('Could not connect to {} endpoint (Code: {})'.format(endpoint, r.status_code), code = 500)
         
         results = r.json()
         return(results['data'])
 
-    def locations_media_recent(self, location_id, count = 15):
+    def locations_media_recent(self, location_id, count = 15, *args, **kwargs):
+        # start from the cursor in case a collection was interrupted
+        cursor = kwargs.pop('cursor', None)
+        media = []
+        params = {}
         endpoint = 'locations/{}/media/recent'.format(location_id)
-        r = self._makeRequest(endpoint)
-        if (r.status_code != 200):
-            raise InstagramError('Could not connect to {} endpoint (Code: {})'.format(endpoint, r.status_code), code = 500)
-        
-        results = r.json()
-        return(results['data'])
+        while True:
+            if (cursor):
+                params['max_id'] = cursor
+            
+            try:
+                r = self._makeRequest(endpoint, params, *args, **kwargs)
+            except KeyboardInterrupt:
+                print("Exiting...")
+                break
+
+            if (r.status_code != 200):
+                raise InstagramError('Could not connect to {} endpoint (Code: {})'.format(endpoint, r.status_code), code = 500)
+            
+            results = r.json()
+            media.extend(results['data'])
+            if len(media) < count and results.get('pagination', False) and results['pagination'].get('next_max_id', False) and len(results['data']) > 0:
+                cursor = results['pagination']['next_max_id']
+            else:
+                break
+                
+        if (count < float('inf')):
+            return(media[:count])
+        else:
+            return(media)
 
     def locations(self, location_id, *args, **kwargs):
         endpoint = 'locations/{}'.format(location_id)
-        r = self._makeRequest(endpoint)
+        r = self._makeRequest(endpoint, *args, **kwargs)
         if (r.status_code != 200):
             raise InstagramError('Could not connect to {} endpoint (Code: {})'.format(endpoint, r.status_code), code = 500)
         
         results = r.json()
         return(results['data'])
+
+    def tag_media_recent(self, tag, count = 33, *args, **kwargs):
+        # start from the cursor in case a collection was interrupted
+        cursor = kwargs.pop('cursor', None)
+        media = []
+        endpoint = 'tags/{}/media/recent'.format(tag)
+        # returns 33 results, max--rounding to 35
+        params = {
+            'count': 35,
+        }
+        while True:
+            if (cursor):
+                params['max_id'] = cursor
+                
+            try:
+                r = self._makeRequest(endpoint, params, *args, **kwargs)
+            except KeyboardInterrupt:
+                print("Exiting...")
+                break
+            if (r.status_code != 200):
+                raise InstagramError('Could not connect to {} endpoint (Code: {})'.format(endpoint, r.status_code), code = 500)
+            
+            results = r.json()
+            media.extend(results['data'])
+            if (len(media) < count and results.get('pagination', False) and results['pagination'].get('next_max_id', False)):
+                cursor = results['pagination']['next_max_id']
+            else:
+                break
+                
+        if (count < float('inf')):
+            return(media[:count])
+        else:
+            return(media)
     
     # experimental story endpoints
     def all_stories(self, session_id, *args, **kwargs):
@@ -284,7 +354,7 @@ class InstaPy:
             'x-ig-capabilities': '36oD'
         }
         endpoint = 'feed/reels_tray'
-        r = self._makeRequest(endpoint, url_base = 'https://i.instagram.com/api/v1/', headers = headers)
+        r = self._makeRequest(endpoint, url_base = 'https://i.instagram.com/api/v1/', headers = headers, *args, **kwargs)
         if (r.status_code != 200):
             raise InstagramError('Could not connect to {} endpoint (Code: {})'.format(endpoint, r.status_code), code = 500)
         
@@ -299,7 +369,7 @@ class InstaPy:
             'x-ig-capabilities': '36oD'
         }
         endpoint = 'feed/user/{}/reel_media'.format(user_id)
-        r = self._makeRequest(endpoint, url_base = 'https://i.instagram.com/api/v1/', headers = headers)
+        r = self._makeRequest(endpoint, url_base = 'https://i.instagram.com/api/v1/', headers = headers, *args, **kwargs)
         if (r.status_code != 200):
             raise InstagramError('Could not connect to {} endpoint (Code: {})'.format(endpoint, r.status_code), code = 500)
         
